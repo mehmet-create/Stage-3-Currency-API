@@ -1,130 +1,162 @@
 import requests
 import random
-from decimal import Decimal, getcontext
-from django.utils import timezone
+import os
+from datetime import datetime
 from django.db import transaction
-from django.db.models import Q # For case-insensitive lookup
-from .models import Country, AppStatus
-from .image_generator import generate_summary_image # Import the image function
+from django.db.models import DecimalField
+from decimal import Decimal # <-- CRUCIAL for precise math
+from PIL import Image, ImageDraw, ImageFont 
 
-# Set precision for Decimal calculations
-getcontext().prec = 28 
+from .models import Country, Status 
+from .exceptions import ExternalApiError 
 
-# --- External API URLs ---
-COUNTRIES_API_URL = "https://restcountries.com/v2/all?fields=name,capital,region,population,flag,currencies"
-EXCHANGE_RATE_API_URL = "https://open.er-api.com/v6/latest/USD"
+# --- Helper for Image Generation (Requires Pillow) ---
 
-def fetch_external_data():
-    """Fetches country and exchange rate data, handling 503 errors."""
+def generate_summary_image(total_countries, refresh_time):
+    """Generates and saves the summary image to cache/summary.png."""
+    
+    # 1. Fetch Top 5 GDP countries (only include those with calculated GDP)
+    top_countries = list(
+        Country.objects
+        .filter(estimated_gdp__isnull=False)
+        .order_by('-estimated_gdp')[:5]
+        .values('name', 'estimated_gdp')
+    )
+    
+    # 2. Setup Canvas and Fonts
+    W, H = 500, 450
+    img = Image.new('RGB', (W, H), color=(240, 240, 240))
+    d = ImageDraw.Draw(img)
+    
+    # Robust font handling to prevent system crash
     try:
-        # 1. Fetch Countries
-        countries_response = requests.get(COUNTRIES_API_URL, timeout=10)
+        # Attempt to load a common system font (will fail on many environments)
+        font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+        font_large = ImageFont.truetype(font_path, 20)
+        font_medium = ImageFont.truetype(font_path, 14)
+    except Exception:
+        # Fallback to the default Pillow font (avoids crash)
+        font_large = ImageFont.load_default()
+        font_medium = ImageFont.load_default()
+
+    # 3. Draw Text
+    d.text((20, 20), "🌐 Country Data Summary", fill=(0, 0, 128), font=font_large)
+    d.text((20, 60), f"Total Cached Countries: {total_countries:,}", fill=(50, 50, 50), font=font_medium)
+    d.text((20, 85), f"Last Global Refresh: {refresh_time.strftime('%Y-%m-%d %H:%M:%S UTC')}", fill=(50, 50, 50), font=font_medium)
+    
+    y_offset = 130
+    d.text((20, y_offset), "🏆 Top 5 by Estimated GDP (USD):", fill=(0, 0, 0), font=font_large)
+    
+    for i, country in enumerate(top_countries):
+        # Format GDP value safely
+        gdp_value = f"{country['estimated_gdp']:,.0f}" if country['estimated_gdp'] is not None else "N/A"
+        text = f"{i+1}. {country['name']}: ${gdp_value}"
+        d.text((30, y_offset + 40 + i * 30), text, fill=(0, 0, 0), font=font_medium)
+
+    # 4. Save Image
+    os.makedirs('cache', exist_ok=True)
+    img.save('cache/summary.png')
+
+
+# --- Core Refresh Logic ---
+
+def refresh_country_data():
+    """Fetches, processes, and stores country and exchange rate data."""
+    
+    # --- 1. Fetch External Data ---
+    try:
+        # Exchange Rates API
+        rate_url = "https://open.er-api.com/v6/latest/USD"
+        rates_response = requests.get(rate_url, timeout=10)
+        rates_response.raise_for_status()
+        exchange_rates = rates_response.json().get('rates', {})
+
+        # Countries API
+        country_url = "https://restcountries.com/v2/all?fields=name,capital,region,population,flag,currencies"
+        countries_response = requests.get(country_url, timeout=10)
         countries_response.raise_for_status()
         countries_data = countries_response.json()
 
-        # 2. Fetch Exchange Rates
-        rates_response = requests.get(EXCHANGE_RATE_API_URL, timeout=10)
-        rates_response.raise_for_status()
-        rates_data = rates_response.json()
-        
-        exchange_rates = rates_data.get('rates', {})
-
-        return countries_data, exchange_rates
-
-    except requests.RequestException as e:
-        # Categorize the 503 error source
-        source = "Exchange Rate API" if 'open.er-api.com' in str(e) else "Country API"
-        raise Exception(f"Could not fetch data from {source}") # Re-raise for view to catch
-
-def process_and_upsert_countries(countries_data, exchange_rates):
-    """Processes data, calculates GDP, and performs database upsert."""
-    current_time = timezone.now()
-    processed_countries = []
+    except requests.exceptions.RequestException as e:
+        # This custom exception handles 503 errors cleanly
+        api_name = 'restcountries.com' if 'country' in str(e) else 'open.er-api.com'
+        raise ExternalApiError(api_name)
     
-    # 1. Process Data
-    for country_data in countries_data:
-        name = country_data.get('name')
-        population = country_data.get('population', 0)
-        
-        # Initialize defaults
-        currency_code = None
-        exchange_rate = None
-        estimated_gdp = None
-        
-        currencies = country_data.get('currencies')
-        
-        if currencies and isinstance(currencies, list) and len(currencies) > 0:
-            # 1a. Extract first currency code
-            currency_code = currencies[0].get('code')
-            
-            if currency_code and currency_code in exchange_rates:
-                # 1b. Calculate Rate and GDP
-                rate = exchange_rates[currency_code]
-                exchange_rate = Decimal(str(rate))
-                
-                # Compute GDP: population * random(1000–2000) / exchange_rate
-                random_multiplier = random.uniform(1000, 2000)
-                
-                # Use Decimal for accurate computation
-                gdp_numerator = Decimal(str(population)) * Decimal(str(random_multiplier))
-                estimated_gdp = (gdp_numerator / exchange_rate).quantize(Decimal('0.00'))
-            
-            elif currency_code:
-                 # Case: Currency code exists but not in exchange rates API
-                 # exchange_rate and estimated_gdp remain None
-                 pass
-            
-        else:
-            # Case: No currency code found
-            estimated_gdp = Decimal('0.00') # Set to 0 if no currency
-        
-        processed_countries.append({
-            'name': name,
-            'capital': country_data.get('capital'),
-            'region': country_data.get('region'),
-            'population': population,
-            'currency_code': currency_code,
-            'exchange_rate': exchange_rate,
-            'estimated_gdp': estimated_gdp,
-            'flag_url': country_data.get('flag'), # restcountries v2 uses 'flag' field for URL
-            'last_refreshed_at': current_time,
-        })
-    
-    # 2. Database Upsert (Use transaction for atomicity)
+    # --- 2. Process and Store/Update (Atomic Transaction) ---
     with transaction.atomic():
-        total_countries = 0
-        for data in processed_countries:
-            # Use Q object for case-insensitive match on name
-            # NOTE: For MySQL efficiency, consider storing a slug or lowercase name
-            try:
-                # Check if country exists (case-insensitive)
-                country = Country.objects.get(Q(name__iexact=data['name']))
-                
-                # Update existing record (re-computing GDP logic is handled in the processing step)
-                for key, value in data.items():
-                    setattr(country, key, value)
-                country.save()
-            
-            except Country.DoesNotExist:
-                # Insert new record
-                Country.objects.create(**data)
-            
-            total_countries += 1
-            
-        # 3. Update AppStatus
-        status, created = AppStatus.objects.get_or_create(pk=1)
-        status.total_countries = total_countries
-        status.last_refreshed_at = current_time
-        status.save()
+        updated_count = 0
+        current_time = datetime.now()
         
-        # 4. Image Generation
-        top_countries = Country.objects.order_by('-estimated_gdp')[:5]
-        generate_summary_image(total_countries, top_countries, current_time)
-        
-        return total_countries
+        for country_data in countries_data:
+            name = country_data.get('name')
+            population = country_data.get('population', 0)
+            
+            # Skip records missing a primary identifier
+            if not name:
+                continue
 
-def refresh_all_data():
-    """Main function to orchestrate the refresh."""
-    countries_data, exchange_rates = fetch_external_data()
-    total = process_and_upsert_countries(countries_data, exchange_rates)
-    return total
+            # --- Currency and GDP Logic ---
+            currency_code = None
+            exchange_rate = None
+            estimated_gdp = None
+
+            currencies = country_data.get('currencies')
+            
+            # Safely extract the first currency code
+            if currencies and isinstance(currencies, list) and len(currencies) > 0:
+                currency_code = currencies[0].get('code')
+                
+            if currency_code:
+                rate = exchange_rates.get(currency_code)
+                
+                if rate:
+                    # Convert to Decimal for precision math
+                    exchange_rate_dec = Decimal(str(rate))
+                    population_dec = Decimal(str(population))
+                    multiplier = Decimal(str(random.uniform(1000, 2000))) 
+                    
+                    # GDP Calculation: (Population * Multiplier) / Exchange Rate
+                    estimated_gdp = (population_dec * multiplier) / exchange_rate_dec
+                    
+                    # Round the Decimal result to 2 places
+                    estimated_gdp = estimated_gdp.quantize(Decimal('0.01'))
+                    
+                    # Assign the rate back (as Decimal) for UPSERT
+                    exchange_rate = exchange_rate_dec
+                else:
+                    # Currency code exists, but no exchange rate found
+                    estimated_gdp = None # Keep NULL/None if rate is missing
+            else:
+                # No currency information found for the country
+                estimated_gdp = Decimal('0.00') # Set to 0 if no currency exists
+
+            # --- UPSERT Logic (update_or_create) ---
+            Country.objects.update_or_create(
+                # Use name__iexact for case-insensitive lookup
+                name__iexact=name, 
+                defaults={
+                    'name': name, # Save the original capitalization from the API
+                    'population': population,
+                    'capital': country_data.get('capital'),
+                    'region': country_data.get('region'),
+                    'flag_url': country_data.get('flag'),
+                    'currency_code': currency_code,
+                    'exchange_rate': exchange_rate,
+                    'estimated_gdp': estimated_gdp,
+                    'last_refreshed_at': current_time
+                }
+            )
+            updated_count += 1
+            
+        # --- 3. Update Status and Image ---
+        Status.objects.update_or_create(
+            pk=1,
+            defaults={
+                'total_countries': updated_count,
+                'last_refreshed_at': current_time
+            }
+        )
+        
+        generate_summary_image(updated_count, current_time)
+        
+        return updated_count, current_time

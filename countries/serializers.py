@@ -1,25 +1,48 @@
 from rest_framework import serializers
-from .models import Country, AppStatus
+from .models import Country
 
 class CountrySerializer(serializers.ModelSerializer):
-    # Ensure id is included
-    id = serializers.IntegerField(read_only=True)
-    
-    # Use CharField for last_refreshed_at to ensure ISO 8601 formatting
-    last_refreshed_at = serializers.DateTimeField(format="%Y-%m-%dT%H:%M:%S%Z", read_only=True)
-    
     class Meta:
         model = Country
-        # List all fields required by the user story
-        fields = (
-            'id', 'name', 'capital', 'region', 'population', 'currency_code',
-            'exchange_rate', 'estimated_gdp', 'flag_url', 'last_refreshed_at'
-        )
+        fields = [
+            'name', 
+            'population', 
+            'currency_code', 
+            'capital', 
+            'region',
+            'last_refreshed_at', # Include to show in output, but make read-only
+            # estimated_gdp, exchange_rate are often included too, if they are model fields
+        ] 
+        
+        # Add the fields that should be set by the server, not the user
+        read_only_fields = [
+            'last_refreshed_at', 
+            'estimated_gdp', 
+            'exchange_rate'
+        ]
 
-class StatusSerializer(serializers.ModelSerializer):
-    # Custom field to format the timestamp
-    last_refreshed_at = serializers.DateTimeField(format="%Y-%m-%dT%H:%M:%S%Z", read_only=True)
+    # Keep your custom validation from before to ensure name, population, and 
+    # currency_code are present, and to return the custom error structure.
+    def validate(self, data):
+        """
+        Custom validation to ensure name, population, and currency_code are present.
+        """
+        required_fields = ['name', 'population', 'currency_code']
+        errors = {}
+        
+        for field in required_fields:
+            value = data.get(field)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                errors[field] = "is required"
 
-    class Meta:
-        model = AppStatus
-        fields = ('total_countries', 'last_refreshed_at')
+        if errors:
+            raise serializers.ValidationError(
+                {'error': "Validation failed", 'details': errors}
+            )
+            
+        return data
+
+class StatusSerializer(serializers.Serializer):
+    """Serializer for Status endpoint output."""
+    total_countries = serializers.IntegerField()
+    last_refreshed_at = serializers.DateTimeField()

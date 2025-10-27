@@ -16,8 +16,19 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path, include
+from countries.views import (
+    RefreshCountriesView, CountryListView, CountryDetailView, 
+    StatusView, SummaryImageView, APIRootView, CountryCreateView
+)
 
 urlpatterns = [
+    path('', APIRootView.as_view()),
     path('admin/', admin.site.urls),
-    path('', include('countries.urls')),
-]    
+    path('countries/refresh', RefreshCountriesView.as_view()),
+    path('countries/create', CountryCreateView.as_view(), name='country-create'),
+    path('countries/image', SummaryImageView.as_view()),
+    path('countries', CountryListView.as_view()),
+    path('countries/<str:name>', CountryDetailView.as_view()), 
+    path('status', StatusView.as_view()),
+    
+]
